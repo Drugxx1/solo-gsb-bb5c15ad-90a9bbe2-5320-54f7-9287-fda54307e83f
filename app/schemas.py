@@ -1,9 +1,9 @@
 """请求/响应数据模型。"""
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
 # 有限实数（拒绝 NaN/Inf），不确定度非负。
@@ -357,5 +357,121 @@ class MonteCarloPropagationResponse(BaseModel):
     deviation: DeviationSummary = Field(
         ..., description="蒙特卡洛统计量相对一阶传播结果的偏差"
     )
+    formula: str
+    whitelist: list[str]
+
+
+# -- 合格判定 ---------------------------------------------------------------
+
+
+class SpecificationLimit(BaseModel):
+    """一个带单位的规格界限；单位须与公式输出同量纲。"""
+
+    value: FiniteFloat
+    unit: str = Field(..., min_length=1, description="规格界限单位，须与模型输出同量纲")
+
+
+class SpecificationLimits(BaseModel):
+    """规格界限：至少给出一个下限或上限；同时给出时为双侧区间。"""
+
+    lower_limit: SpecificationLimit | None = Field(
+        default=None, description="规格下限 L（带单位）；缺省表示仅上限"
+    )
+    upper_limit: SpecificationLimit | None = Field(
+        default=None, description="规格上限 U（带单位）；缺省表示仅下限"
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_limit(self) -> "SpecificationLimits":
+        if self.lower_limit is None and self.upper_limit is None:
+            raise PydanticCustomError(
+                "missing_specification_limit",
+                "至少需要提供一个规格界限（lower_limit 或 upper_limit）",
+            )
+        return self
+
+
+class ConformityRequest(BaseModel):
+    """合格判定请求：inputs/formula/correlation_matrix 与传播接口一致。"""
+
+    inputs: list[InputQuantity] = Field(..., min_length=1)
+    formula: str = Field(..., min_length=1, description="仅含白名单运算的测量公式")
+    correlation_matrix: list[list[FiniteFloat]] | None = Field(
+        default=None,
+        description="输入量相关系数矩阵，顺序与 inputs 一致；缺省为单位阵（互不相关）",
+    )
+    specification_limits: SpecificationLimits = Field(
+        ..., description="带单位的规格界限（至少一个），单位须与公式输出同量纲"
+    )
+    confidence_threshold: float = Field(
+        ...,
+        gt=0.5,
+        lt=1.0,
+        description="置信阈值 t（严格 0.5 < t < 1）：p≥t 合格，p≤1−t 不合格",
+    )
+
+
+class RequestedLimitEcho(BaseModel):
+    """回显请求中声明的原始规格界限（未换算）。"""
+
+    value: float
+    unit: str
+
+
+class ConvertedLimit(BaseModel):
+    """换算到输出单位后的单侧规格界限。"""
+
+    side: Literal["lower", "upper"]
+    value: float = Field(..., description="换算到输出单位后的界限数值")
+    unit: str
+    requested: RequestedLimitEcho = Field(..., description="请求中声明的原始界限")
+
+
+class Bound(BaseModel):
+    """接受区间的一侧边界（带单位）。"""
+
+    value: float
+    unit: str
+
+
+class AcceptanceInterval(BaseModel):
+    """固定 u_c 时使包含概率 p≥t 的全部 y 构成的闭接受区间。
+
+    type=closed 时两侧均闭合；lower_bounded / upper_bounded 为半无限区间；
+    empty 表示双侧区间中点最大概率仍小于 t，无任何 y 可合格。
+    """
+
+    type: Literal["empty", "closed", "lower_bounded", "upper_bounded"]
+    reachable: bool = Field(
+        ..., description="接受区间是否可达；false 时为空区间（双侧最大概率仍 < t）"
+    )
+    lower_bound: Bound | None = Field(..., description="下界（含）；半无限/空区间为 null")
+    upper_bound: Bound | None = Field(..., description="上界（含）；半无限/空区间为 null")
+    unit: str
+
+
+class ConformityResponse(BaseModel):
+    """合格判定响应：包含概率、判定结论、一阶结果、换算界限与接受区间。"""
+
+    result: QuantityResult = Field(
+        ..., description="一阶传播结果值 y（value）、单位与合成标准不确定度 u_c"
+    )
+    probability: float = Field(
+        ...,
+        description=(
+            "假定真值 Y ~ N(y, u_c²) 时落入闭规格区间的概率 p；"
+            "极端尾部保留可表示的非零值"
+        ),
+    )
+    decision: Literal["conform", "not_conform", "inconclusive"] = Field(
+        ..., description="判定结论：合格 / 不合格 / 待定"
+    )
+    confidence_threshold: float = Field(..., description="回显置信阈值 t")
+    specification_limits: list[ConvertedLimit] = Field(
+        ..., description="换算到输出单位后的规格界限（含请求原值回显）"
+    )
+    acceptance_interval: AcceptanceInterval
+    number_of_inputs: int = Field(..., description="参与传播的输入量数量")
+    correlation_matrix: list[list[float]]
     formula: str
     whitelist: list[str]

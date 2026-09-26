@@ -15,22 +15,27 @@ $C=J\Sigma J^{T}$，一次返回 2～8 个输出量的值、单位、合成标�
 分解，奇异相关矩阵亦可运行），逐样本计算白名单公式，返回样本均值、标准不确定度、
 2.5%/50%/97.5% 分位数及相对一阶传播结果的偏差，用于校核 GUM 线性化近似。
 
+另提供**合格判定**接口：在 GUM 一阶传播得到 $y$、$u_c$ 后，假定真值服从
+$N(y,u_c^2)$，稳定计算其落入闭规格区间的概率 $p$，按置信阈值 $t$ 判定合格 /
+不合格 / 待定，并给出固定 $u_c$ 时使 $p\ge t$ 的全部 $y$ 构成的闭接受区间。
+
 ## 启动
 
-单条命令一键启动（Docker Compose）：
+单条命令一键启动（Docker Compose；构建镜像、容器启动时安装依赖并初始化服务）：
 
 ```bash
 docker compose up --build
 ```
 
-依赖在**容器启动时**安装；服务随后监听 API 端口 **8000**（交互文档
-`http://localhost:8000/docs`）。
+服务监听地址与端口：**http://localhost:8000**（容器内固定监听 `0.0.0.0:8000`；
+交互文档 `http://localhost:8000/docs`，OpenAPI 描述 `http://localhost:8000/openapi.json`）。
 
 ## 配置
 
 - 宿主机端口：通过环境变量 `PORT` 覆盖（默认 `8000`），容器内固定监听 `8000`。
-  例：`PORT=9000 docker compose up --build`
-- 依赖清单：`requirements.txt`（容器启动时由 `docker/entrypoint.sh` 安装）。
+  例：`PORT=9000 docker compose up --build`，随后访问 `http://localhost:9000`。
+- 依赖清单：`requirements.txt`（容器启动时由 `docker/entrypoint.sh` 安装），
+  无需在宿主机预装任何 Python 依赖。
 
 ## API（端口 8000）
 
@@ -40,6 +45,7 @@ docker compose up --build
 - `POST /api/v1/propagate-joint` — 多输出联合传播（见下）
 - `POST /api/v1/allocate-uncertainty` — 不确定度逆分配（见下）
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
+- `POST /api/v1/conformity` — 合格判定：闭规格区间包含概率与接受区间（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -254,3 +260,130 @@ $x=0.01$、$u(x)=1$ 时：
 `samples` 越界、`seed` 非法（负数或超过 $2^{63}-1$）返回 **422** 并定位到对应
 字段；相关矩阵非法、单位/量纲不兼容、公式不合法等沿用传播接口的同一套校验与
 code/loc。
+
+### 合格判定 `POST /api/v1/conformity`
+
+请求体复用 `/api/v1/propagate` 的 `inputs`、`formula` 与 `correlation_matrix`
+校验（同样的白名单、量纲/单位检查与相关矩阵检查），额外要求：
+
+- `specification_limits` — **带单位的规格界限，至少给出一个**：
+  `lower_limit` / `upper_limit`，均为 `{value, unit}`；只给一个为单侧界限，
+  两个都给为双侧闭区间 $[L,U]$。界限单位须与公式输出**同量纲**（支持前缀与
+  `degC/degF` 等偏移单位换算）；双侧时换算后下限必须**严格小于**上限。
+- `confidence_threshold` — 置信阈值 $t$，严格 $0.5<t<1$。
+
+服务端先做 GUM 一阶传播得到结果值 $y$ 与合成标准不确定度 $u_c$，再假定真值
+$Y\sim N(y,u_c^2)$，计算其落入**闭规格区间**的概率
+
+$$
+p=P(L\le Y\le U)=\Phi\!\left(\frac{U-y}{u_c}\right)-\Phi\!\left(\frac{L-y}{u_c}\right),
+$$
+
+单侧时为 $\Phi((U-y)/u_c)$（仅上限）或 $Q((L-y)/u_c)=1-\Phi((L-y)/u_c)$
+（仅下限）。概率全程用 `erfc` 尾部公式分符号区间计算，避免 $1-\Phi(\cdot)$
+相消——即使规格远在 30σ 之外，仍返回**可表示的非零尾部概率**；
+$u_c=0$ 时按确定值 $Y=y$ 处理（边界算落入，$p\in\{0,1\}$）。
+
+判定（结论为 `decision`）：
+
+- $p\ge t$：`conform`（合格）；
+- $p\le 1-t$：`not_conform`（不合格）；
+- 其余：`inconclusive`（待定）。
+
+响应同时给出固定 $u_c$ 时使 $p\ge t$ 的**全部 $y$** 构成的闭接受区间
+（`acceptance_interval`，界限与输出同量纲）：
+
+- **双侧**：概率在区间中点 $m=(L+U)/2$ 处最大，$p_{\max}=2\Phi((U-L)/(2u_c))-1$。
+  若 $p_{\max}<t$，任何 $y$ 都无法合格，返回**空区间**
+  （`type: "empty"`、`reachable: false`、两侧为 `null`）；否则区间关于中点对称，
+  半宽 $z^*$ 由 $\Phi((H-z^*)/u_c)-\Phi((-H-z^*)/u_c)=t$（$H=(U-L)/2$）数值求解，
+  返回 $[m-z^*,m+z^*]$；$p_{\max}=t$ 时退化为中点一个点。
+- **单侧**：半无限区间——仅下限时 $[L+u_c\Phi^{-1}(t),+\infty)$
+  （`type: "lower_bounded"`），仅上限时 $(-\infty,U-u_c\Phi^{-1}(t)]$
+  （`type: "upper_bounded"`），取不到的一侧为 `null`。
+- $u_c=0$：接受区间即 $[L,U]$、$[L,+\infty)$ 或 $(-\infty,U]$。
+
+请求示例（$P=U\cdot I$，$r(U,I)=0.5$，规格 $[18,22]\,\mathrm{W}$，$t=0.95$）：
+
+```bash
+curl -s http://localhost:8000/api/v1/conformity \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+      {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.05}
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "specification_limits": {
+      "lower_limit": {"value": 18.0, "unit": "W"},
+      "upper_limit": {"value": 22.0, "unit": "W"}
+    },
+    "confidence_threshold": 0.95
+  }'
+```
+
+响应（节选；$u_c=\sqrt{0.39}\approx0.6245\,\mathrm{W}$，$p\approx0.9986$ 合格）：
+
+```json
+{
+  "result": {"value": 20.0, "unit": "W", "standard_uncertainty": 0.6244997998398398},
+  "probability": 0.9986378953284158,
+  "decision": "conform",
+  "confidence_threshold": 0.95,
+  "specification_limits": [
+    {"side": "lower", "value": 18.0, "unit": "W", "requested": {"value": 18.0, "unit": "W"}},
+    {"side": "upper", "value": 22.0, "unit": "W", "requested": {"value": 22.0, "unit": "W"}}
+  ],
+  "acceptance_interval": {
+    "type": "closed",
+    "reachable": true,
+    "lower_bound": {"value": 19.02721661435849, "unit": "W"},
+    "upper_bound": {"value": 20.97278338564151, "unit": "W"},
+    "unit": "W"
+  }
+}
+```
+
+单侧示例（仅下限 $19\,\mathrm{W}$，$t=0.9$）：接受区间为半无限的
+$[19+u_c\Phi^{-1}(0.9),+\infty)=[19.8003\,\mathrm{W},+\infty)$：
+
+```json
+{
+  "probability": 0.9453427118956668,
+  "decision": "conform",
+  "acceptance_interval": {
+    "type": "lower_bounded",
+    "reachable": true,
+    "lower_bound": {"value": 19.800328696167036, "unit": "W"},
+    "upper_bound": null,
+    "unit": "W"
+  }
+}
+```
+
+双侧最大概率仍低于阈值时返回空接受区间（如规格 $[19.75,20.25]\,\mathrm{W}$、
+$t=0.95$，$p_{\max}\approx0.311<t$）：
+
+```json
+{
+  "probability": 0.31107944419553935,
+  "decision": "inconclusive",
+  "acceptance_interval": {"type": "empty", "reachable": false,
+                          "lower_bound": null, "upper_bound": null, "unit": "W"}
+}
+```
+
+界限单位支持换算（如 `{"value": 18000, "unit": "mW"}` 与
+`{"value": 68, "unit": "degF"}`）；响应 `specification_limits` 给出换算到输出
+单位后的界限并在 `requested` 中回显原始值/单位。以下情况返回 **422**，错误体
+带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `missing_specification_limit` | `specification_limits` | 上下限均未给出 |
+| `invalid_specification_limits` | `specification_limits` | 双侧换算后下限不小于上限 |
+| `incompatible_unit` | `specification_limits.<lower_limit\|upper_limit>.unit` | 界限单位与输出量纲不一致 |
+| `greater_than_equal` / `less_than_equal` 等 | `confidence_threshold` | $t$ 不在严格区间 $(0.5,1)$ 内 |
+
+相关矩阵非法、公式不合法、输入量单位错误等沿用传播接口的同一套校验与 code/loc。
