@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
 from .allocation import allocate
+from .conformity import assess_conformity
 from .errors import UnprocessableError, request_validation_handler, unprocessable_handler
 from .formula import WHITELIST_DISPLAY
 from .joint import propagate_joint
@@ -13,6 +14,8 @@ from .propagation import propagate
 from .schemas import (
     AllocationRequest,
     AllocationResponse,
+    ConformityRequest,
+    ConformityResponse,
     JointPropagationRequest,
     JointPropagationResponse,
     MonteCarloPropagationRequest,
@@ -87,6 +90,18 @@ _MONTE_CARLO_EXAMPLE = {
     "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
     "samples": 50000,
     "seed": 20260920,
+}
+
+_CONFORMITY_EXAMPLE = {
+    "inputs": [
+        {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+        {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.05},
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "lower_limit": {"value": 18.5, "unit": "W"},
+    "upper_limit": {"value": 21.5, "unit": "W"},
+    "confidence_threshold": 0.95,
 }
 
 
@@ -164,3 +179,24 @@ def calculate_monte_carlo(req: MonteCarloPropagationRequest) -> dict:
 def allocate_uncertainty(req: AllocationRequest) -> dict:
     """把指定输入量的标准不确定度视为未知量，反求满足目标合成标准不确定度的最大非负值。"""
     return allocate(req)
+
+
+@app.post(
+    "/api/v1/conformity",
+    response_model=ConformityResponse,
+    tags=["uncertainty"],
+    responses={
+        422: {
+            "description": (
+                "规格界限缺失 missing_spec_limits / 量纲不兼容 incompatible_unit / "
+                "下限不小于上限 invalid_spec_limits，或相关矩阵非法、单位/量纲不兼容等"
+            )
+        }
+    },
+    openapi_extra={
+        "examples": {"P=U*I：双侧规格限 18.5~21.5 W，t=0.95": {"value": _CONFORMITY_EXAMPLE}},
+    },
+)
+def check_conformity(req: ConformityRequest) -> dict:
+    """规格符合性判定：一阶传播 + N(y, u_c²) 假设下落入闭规格区间的概率、判定与接受区间。"""
+    return assess_conformity(req)

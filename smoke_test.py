@@ -1074,4 +1074,228 @@ b = r.json()
 assert b["correlation_matrix"] == [[1.0]]
 assert abs(b["result"]["value"] - (2.0 + math.log2(100.0))) < 0.02
 
+# --- POST /api/v1/conformity ----------------------------------------------
+
+_Phi = lambda z: 0.5 * math.erfc(-z / math.sqrt(2.0))
+_Q = lambda z: 0.5 * math.erfc(z / math.sqrt(2.0))
+_UC = 0.39 ** 0.5  # P=U*I, r=0.5 时的合成标准不确定度
+
+_CONF_BASE = {
+    "inputs": [
+        {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+        {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.05},
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "confidence_threshold": 0.95,
+}
+
+# 50) 双侧规格限 18.5~21.5 W，t=0.95 -> 合格；接受区间边界处 p=t
+r = client.post(
+    "/api/v1/conformity",
+    json={
+        **_CONF_BASE,
+        "lower_limit": {"value": 18.5, "unit": "W"},
+        "upper_limit": {"value": 21.5, "unit": "W"},
+    },
+)
+show("50) conformity pass, two-sided 18.5~21.5 W", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["decision"] == "pass"
+assert abs(b["probability"] - (2 * _Phi(1.5 / _UC) - 1)) < 1e-12
+assert b["confidence_threshold"] == 0.95
+assert b["result"] == {"value": 20.0, "unit": "W", "standard_uncertainty": _UC}
+assert b["lower_limit"] == {"value": 18.5, "unit": "W"}
+assert b["upper_limit"] == {"value": 21.5, "unit": "W"}
+ai = b["acceptance_interval"]
+assert ai["unit"] == "W" and not ai["is_empty"]
+assert ai["lower"] < 20.0 < ai["upper"]
+# 边界关于中点对称，且边界处概率恰为 t
+assert abs(ai["lower"] + ai["upper"] - 40.0) < 1e-9
+for yb in (ai["lower"], ai["upper"]):
+    assert abs((_Phi((21.5 - yb) / _UC) - _Phi((18.5 - yb) / _UC)) - 0.95) < 1e-12
+
+# 51) 窄区间 -> 待定；中点最大概率仍低于阈值 -> 接受区间为空
+r = client.post(
+    "/api/v1/conformity",
+    json={
+        **_CONF_BASE,
+        "lower_limit": {"value": 19.9, "unit": "W"},
+        "upper_limit": {"value": 20.1, "unit": "W"},
+    },
+)
+show("51) conformity indeterminate, empty acceptance", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "indeterminate"
+assert abs(b["probability"] - (_Phi(0.1 / _UC) - _Phi(-0.1 / _UC))) < 1e-12
+assert b["acceptance_interval"] == {
+    "lower": None,
+    "upper": None,
+    "unit": "W",
+    "is_empty": True,
+}
+
+# 52) 区间整体偏上 -> 不合格（上尾差保留非零概率）
+r = client.post(
+    "/api/v1/conformity",
+    json={
+        **_CONF_BASE,
+        "lower_limit": {"value": 21.5, "unit": "W"},
+        "upper_limit": {"value": 22.5, "unit": "W"},
+    },
+)
+show("52) conformity fail", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "fail"
+assert abs(b["probability"] - (_Q(1.5 / _UC) - _Q(2.5 / _UC))) < 1e-15
+
+# 53) 仅上限 -> 半无限接受区间 (-inf, U - uc*z_t]
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "upper_limit": {"value": 21.5, "unit": "W"}},
+)
+show("53) upper limit only", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "pass" and b["lower_limit"] is None
+assert abs(b["probability"] - _Phi(1.5 / _UC)) < 1e-15
+_zt = 1.6448536269514715  # Phi^{-1}(0.95)
+ai = b["acceptance_interval"]
+assert ai["lower"] is None and not ai["is_empty"]
+assert abs(ai["upper"] - (21.5 - _UC * _zt)) < 1e-12
+
+# 54) 仅下限 -> 半无限接受区间 [L + uc*z_t, +inf)
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "lower_limit": {"value": 18.5, "unit": "W"}},
+)
+show("54) lower limit only", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "pass" and b["upper_limit"] is None
+assert abs(b["probability"] - _Q(-1.5 / _UC)) < 1e-15
+ai = b["acceptance_interval"]
+assert ai["upper"] is None
+assert abs(ai["lower"] - (18.5 + _UC * _zt)) < 1e-12
+
+# 55) u_c = 0 按确定值处理：区间内 p=1 合格，区间外 p=0 不合格；接受区间即规格区间
+_DET = {
+    "inputs": [{"name": "x", "value": 5.0, "unit": "m", "standard_uncertainty": 0.0}],
+    "formula": "x*2",
+    "confidence_threshold": 0.9,
+}
+r = client.post(
+    "/api/v1/conformity",
+    json={**_DET, "lower_limit": {"value": 9, "unit": "m"}, "upper_limit": {"value": 11, "unit": "m"}},
+)
+show("55) uc=0 deterministic inside", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "pass" and b["probability"] == 1.0
+assert b["result"]["standard_uncertainty"] == 0.0
+assert b["acceptance_interval"] == {"lower": 9.0, "upper": 11.0, "unit": "m", "is_empty": False}
+r = client.post(
+    "/api/v1/conformity",
+    json={**_DET, "lower_limit": {"value": 10.5, "unit": "m"}, "upper_limit": {"value": 11, "unit": "m"}},
+)
+assert r.json()["decision"] == "fail" and r.json()["probability"] == 0.0
+# 单侧 + uc=0：接受区间端点即界限本身
+r = client.post("/api/v1/conformity", json={**_DET, "upper_limit": {"value": 10, "unit": "m"}})
+assert r.json()["acceptance_interval"]["upper"] == 10.0
+r = client.post("/api/v1/conformity", json={**_DET, "lower_limit": {"value": 10, "unit": "m"}})
+assert r.json()["acceptance_interval"]["lower"] == 10.0
+
+# 56) 界限单位换算：18500 mW = 18.5 W，0.0215 kW = 21.5 W
+r = client.post(
+    "/api/v1/conformity",
+    json={
+        **_CONF_BASE,
+        "lower_limit": {"value": 18500, "unit": "mW"},
+        "upper_limit": {"value": 0.0215, "unit": "kW"},
+    },
+)
+show("56) limit unit conversion mW/kW -> W", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "pass"
+assert b["lower_limit"] == {"value": 18.5, "unit": "W"}
+assert b["upper_limit"] == {"value": 21.5, "unit": "W"}
+
+# 57) 远尾非零概率：区间 [30,31] m、y=0、uc=1 -> p ≈ 4.9e-198（朴素 1-Phi 会饱和为 0）
+r = client.post(
+    "/api/v1/conformity",
+    json={
+        "inputs": [{"name": "x", "value": 0.0, "unit": "m", "standard_uncertainty": 1.0}],
+        "formula": "x",
+        "lower_limit": {"value": 30, "unit": "m"},
+        "upper_limit": {"value": 31, "unit": "m"},
+        "confidence_threshold": 0.95,
+    },
+)
+show("57) far-tail non-zero probability", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["decision"] == "fail"
+assert 0.0 < b["probability"] < 1e-190
+assert abs(b["probability"] - (_Q(30.0) - _Q(31.0))) / b["probability"] < 1e-10
+
+# 58) 界限量纲不一致 -> 422 定位到界限单位
+r = client.post("/api/v1/conformity", json={**_CONF_BASE, "lower_limit": {"value": 1, "unit": "A"}})
+show("58) limit unit A vs W -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "incompatible_unit"
+assert r.json()["error"]["loc"] == ["lower_limit", "unit"]
+r = client.post("/api/v1/conformity", json={**_CONF_BASE, "upper_limit": {"value": 1, "unit": "s"}})
+assert r.status_code == 422
+assert r.json()["error"]["loc"] == ["upper_limit", "unit"]
+
+# 59) 双侧下限不小于上限 -> 422（含相等情形）
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "lower_limit": {"value": 21, "unit": "W"}, "upper_limit": {"value": 18.5, "unit": "W"}},
+)
+show("59) lower >= upper -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "invalid_spec_limits"
+assert r.json()["error"]["loc"] == ["lower_limit", "value"]
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "lower_limit": {"value": 20, "unit": "W"}, "upper_limit": {"value": 20, "unit": "W"}},
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_spec_limits"
+
+# 60) 未给任何界限 -> 422 missing_spec_limits
+r = client.post("/api/v1/conformity", json=_CONF_BASE)
+show("60) no limits -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "missing_spec_limits"
+
+# 61) 置信阈值越界（须严格满足 0.5 < t < 1）-> 422 定位到字段
+for bad_t in (0.5, 1.0, 0.3, 1.5):
+    r = client.post(
+        "/api/v1/conformity",
+        json={**_CONF_BASE, "upper_limit": {"value": 21, "unit": "W"}, "confidence_threshold": bad_t},
+    )
+    assert r.status_code == 422 and r.json()["error"]["loc"] == ["confidence_threshold"], (bad_t, r.json())
+
+# 62) 复用传播校验：相关矩阵越界 / 量纲不一致 / 未声明符号
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "upper_limit": {"value": 21, "unit": "W"}, "correlation_matrix": [[1, 1.2], [1.2, 1]]},
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "correlation_out_of_range"
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "upper_limit": {"value": 21, "unit": "W"}, "formula": "U+I"},
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "dimension_mismatch"
+r = client.post(
+    "/api/v1/conformity",
+    json={**_CONF_BASE, "upper_limit": {"value": 21, "unit": "W"}, "formula": "U+V"},
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_symbol"
+
 print("\nALL TESTS PASSED")

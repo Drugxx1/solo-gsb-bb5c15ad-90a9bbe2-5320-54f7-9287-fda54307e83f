@@ -15,6 +15,10 @@ $C=J\Sigma J^{T}$，一次返回 2～8 个输出量的值、单位、合成标�
 分解，奇异相关矩阵亦可运行），逐样本计算白名单公式，返回样本均值、标准不确定度、
 2.5%/50%/97.5% 分位数及相对一阶传播结果的偏差，用于校核 GUM 线性化近似。
 
+另提供**规格符合性判定**接口：在一阶传播结果 $(y,u_c)$ 上假定真值服从 $N(y,u_c^2)$，
+稳定计算落入闭规格区间的概率 $p$（保留可表示的非零尾部概率），按置信阈值 $t$ 判定
+合格/不合格/待定，并给出固定 $u_c$ 时使 $p\ge t$ 的接受区间。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -40,6 +44,7 @@ docker compose up --build
 - `POST /api/v1/propagate-joint` — 多输出联合传播（见下）
 - `POST /api/v1/allocate-uncertainty` — 不确定度逆分配（见下）
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
+- `POST /api/v1/conformity` — 规格符合性判定（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -254,3 +259,91 @@ $x=0.01$、$u(x)=1$ 时：
 `samples` 越界、`seed` 非法（负数或超过 $2^{63}-1$）返回 **422** 并定位到对应
 字段；相关矩阵非法、单位/量纲不兼容、公式不合法等沿用传播接口的同一套校验与
 code/loc。
+
+### 规格符合性判定 `POST /api/v1/conformity`
+
+请求体复用 `/api/v1/propagate` 的 `inputs`、`formula` 与 `correlation_matrix`
+（同样的白名单、量纲/单位检查与相关矩阵检查），额外要求：
+
+- `lower_limit` / `upper_limit` — **带单位的规格界限** `{value, unit}`，至少给出
+  一个；单位须与公式输出同量纲（支持换算，如 `mW`→`W`），双侧时下限须小于上限；
+- `confidence_threshold` — 置信阈值 $t$，须严格满足 $0.5<t<1$。
+
+服务端先做 GUM 一阶传播得到 $(y,u_c)$，再假定真值服从 $N(y,u_c^2)$，计算落入
+**闭规格区间**的概率
+
+$$
+p=P(L\le Y\le U)=\Phi\!\left(\tfrac{U-y}{u_c}\right)-\Phi\!\left(\tfrac{L-y}{u_c}\right)
+$$
+
+（单侧界限时退化为相应的单尾概率）。$\Phi$ 一律经 `erfc` 计算，双侧概率在区间整体
+位于均值上方时改用上尾差 $Q(z_L)-Q(z_U)$，避免 $1-\Phi$ 在远尾饱和为 1——可表示的
+**非零尾部概率**（约到 $10^{-308}$ 量级）得以保留。判定规则：
+
+| 条件 | `decision` | 含义 |
+| --- | --- | --- |
+| $p \ge t$ | `"pass"` | 合格 |
+| $p \le 1-t$ | `"fail"` | 不合格 |
+| 其余 | `"indeterminate"` | 待定 |
+
+响应返回 `probability`（$p$）、`result`（$y$、单位、$u_c$）、换算到结果显示单位的
+`lower_limit`/`upper_limit`，以及 `acceptance_interval`——**固定 $u_c$ 时使
+$p(y)\ge t$ 的全部 $y$ 构成的闭接受区间**：
+
+- 双侧界限：$p(y)$ 在中点 $(L+U)/2$ 处取最大值 $2\Phi\!\left(\tfrac{U-L}{2u_c}\right)-1$；
+  最大概率仍低于 $t$ 时接受区间为空（`is_empty: true`，两端为 `null`），否则在
+  中点两侧分别二分求解 $p(y)=t$ 得到两个边界；
+- 单侧界限：直接由分位数给出半无限区间，如仅上限时为
+  $\big(-\infty,\;U-u_c\,\Phi^{-1}(t)\big]$（无穷端为 `null`）；
+- $u_c=0$ 按确定值处理：$p\in\{0,1\}$，接受区间即闭规格区间本身。
+
+请求示例（$P=U\cdot I$，$r(U,I)=0.5$，双侧规格限 $18.5\sim21.5\,\mathrm{W}$，
+$t=0.95$；服务地址 `http://localhost:8000`）：
+
+```bash
+curl -s http://localhost:8000/api/v1/conformity \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+      {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.05}
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "lower_limit": {"value": 18.5, "unit": "W"},
+    "upper_limit": {"value": 21.5, "unit": "W"},
+    "confidence_threshold": 0.95
+  }'
+```
+
+响应（$u_c=\sqrt{0.39}\approx0.6245\,\mathrm{W}$，$p\approx0.9837\ge0.95$ 判合格）：
+
+```json
+{
+  "decision": "pass",
+  "probability": 0.983690828122245,
+  "confidence_threshold": 0.95,
+  "result": {"value": 20.0, "unit": "W", "standard_uncertainty": 0.6244997998398398},
+  "lower_limit": {"value": 18.5, "unit": "W"},
+  "upper_limit": {"value": 21.5, "unit": "W"},
+  "acceptance_interval": {
+    "lower": 19.53216838235092,
+    "upper": 20.46783161764908,
+    "unit": "W",
+    "is_empty": false
+  },
+  "formula": "U*I"
+}
+```
+
+以下情况返回 **422**，错误体带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `missing_spec_limits` | `[]` | 未给出任何规格界限 |
+| `incompatible_unit` | `lower_limit.unit` / `upper_limit.unit` | 界限单位与公式输出量纲不一致 |
+| `unknown_unit` | `lower_limit.unit` / `upper_limit.unit` | 界限单位无法识别 |
+| `invalid_spec_limits` | `lower_limit.value` | 双侧界限换算后下限不小于上限 |
+| `greater_than` / `less_than` | `confidence_threshold` | 置信阈值未严格落在 $(0.5,1)$ 内 |
+
+相关矩阵非法、公式不合法、输入量单位错误等沿用传播接口的同一套校验与 code/loc。
